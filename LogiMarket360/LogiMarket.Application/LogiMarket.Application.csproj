@@ -6,4 +6,8 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\LogiMarket.Domain\LogiMarket.Domain.csproj" />
+  </ItemGroup>
+
 </Project>
