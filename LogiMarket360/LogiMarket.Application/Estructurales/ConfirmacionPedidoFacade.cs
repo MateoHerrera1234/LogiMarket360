@@ -1,0 +1,206 @@
+﻿using System;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using LogiMarket.Application.Creacionales;
+using LogiMarket.Application.Puertos;
+using LogiMarket.Domain.Enums;
+using LogiMarket.Domain.Pedidos;
+
+namespace LogiMarket.Application.Estructurales;
+
+// Resultado de la confirmacion coordinada de un pedido
+public sealed record ResultadoConfirmacionPedido(
+    bool Exitoso,
+    string Mensaje,
+    Guid PedidoId,
+    string CodigoPedido,
+    decimal TotalCobrado,
+    string ReferenciaPago,
+    string NumeroGuia);
+
+// Fachada que coordina autorizacion, validacion, cobro idempotente, persistencia, stock y Outbox
+public sealed class ConfirmacionPedidoFacade
+{
+    private readonly IContextoSesion _sesion;
+    private readonly IRepositorioPedidos _repositorioPedidos;
+    private readonly IRepositorioCatalogo _repositorioCatalogo;
+    private readonly IRepositorioAuditoriaOutbox _auditoriaOutbox;
+    private readonly IUnidadTrabajo _unidadTrabajo;
+    private readonly IPasarelaPago _pasarelaPago;
+    private readonly IMetricasSesion _metricas;
+
+    public ConfirmacionPedidoFacade(
+        IContextoSesion sesion,
+        IRepositorioPedidos repositorioPedidos,
+        IRepositorioCatalogo repositorioCatalogo,
+        IRepositorioAuditoriaOutbox auditoriaOutbox,
+        IUnidadTrabajo unidadTrabajo,
+        IPasarelaPago pasarelaPago,
+        IMetricasSesion metricas)
+    {
+        _sesion = sesion ?? throw new ArgumentNullException(nameof(sesion));
+        _repositorioPedidos = repositorioPedidos ?? throw new ArgumentNullException(nameof(repositorioPedidos));
+        _repositorioCatalogo = repositorioCatalogo ?? throw new ArgumentNullException(nameof(repositorioCatalogo));
+        _auditoriaOutbox = auditoriaOutbox ?? throw new ArgumentNullException(nameof(auditoriaOutbox));
+        _unidadTrabajo = unidadTrabajo ?? throw new ArgumentNullException(nameof(unidadTrabajo));
+        _pasarelaPago = pasarelaPago ?? throw new ArgumentNullException(nameof(pasarelaPago));
+        _metricas = metricas ?? throw new ArgumentNullException(nameof(metricas));
+    }
+
+    public async Task<ResultadoConfirmacionPedido> ConfirmarAsync(
+        Pedido pedido,
+        string claveIdempotencia,
+        CancellationToken ct = default)
+    {
+        if (pedido is null)
+            throw new ArgumentNullException(nameof(pedido));
+
+        if (string.IsNullOrWhiteSpace(claveIdempotencia))
+            throw new ArgumentException("La clave de idempotencia es obligatoria", nameof(claveIdempotencia));
+
+        if (!_sesion.TienePermiso(RolUsuario.VENTAS, RolUsuario.ADMIN))
+        {
+            string rolActual = _sesion.UsuarioActual?.Rol.ToString() ?? "SIN_SESION";
+            return new ResultadoConfirmacionPedido(
+                false,
+                $"Permiso denegado para confirmar pedidos con rol {rolActual}",
+                pedido.Id,
+                pedido.Codigo,
+                pedido.Total,
+                string.Empty,
+                string.Empty);
+        }
+
+        if (await _repositorioPedidos.ExisteClaveIdempotenciaAsync(claveIdempotencia, ct))
+        {
+            return new ResultadoConfirmacionPedido(
+                false,
+                $"Operacion duplicada detectada (idempotencia: {claveIdempotencia})",
+                pedido.Id,
+                pedido.Codigo,
+                pedido.Total,
+                string.Empty,
+                string.Empty);
+        }
+
+        if (pedido.Estado == EstadoPedido.BORRADOR)
+            pedido.Validar();
+
+        var requerimientos = pedido.ObtenerRequerimientosStockPorSku();
+        foreach (var (sku, cantidadRequerida) in requerimientos)
+        {
+            var elemento = await _repositorioCatalogo.ObtenerPorSkuAsync(sku, ct);
+            if (elemento is null)
+            {
+                return new ResultadoConfirmacionPedido(
+                    false,
+                    $"No existe el componente fisico con SKU {sku}",
+                    pedido.Id,
+                    pedido.Codigo,
+                    pedido.Total,
+                    string.Empty,
+                    string.Empty);
+            }
+
+            if (elemento.StockDisponible < cantidadRequerida)
+            {
+                return new ResultadoConfirmacionPedido(
+                    false,
+                    $"Stock insuficiente para SKU {sku}: disponible {elemento.StockDisponible}, requerido {cantidadRequerida}",
+                    pedido.Id,
+                    pedido.Codigo,
+                    pedido.Total,
+                    string.Empty,
+                    string.Empty);
+            }
+        }
+
+        var cobro = await _pasarelaPago.CobrarAsync(pedido.Total, claveIdempotencia, ct);
+        if (!cobro.Exitoso)
+        {
+            _metricas.RegistrarCobroRechazado();
+            return new ResultadoConfirmacionPedido(
+                false,
+                $"Cobro rechazado: {cobro.Mensaje}",
+                pedido.Id,
+                pedido.Codigo,
+                pedido.Total,
+                cobro.ReferenciaTransaccion,
+                string.Empty);
+        }
+
+        pedido.MarcarComoPagado();
+        string usuario = _sesion.UsuarioActual?.NombreUsuario ?? "SISTEMA";
+        string guiaGenerada = SelectorFabricaEntrega
+            .ObtenerFabrica(pedido.TipoEntrega)
+            .CrearGeneradorGuia()
+            .GenerarEtiquetaGuia(pedido.Codigo, pedido.NombreCliente);
+
+        await _unidadTrabajo.EjecutarEnTransaccionAsync(async token =>
+        {
+            var existente = await _repositorioPedidos.ObtenerPorIdAsync(pedido.Id, token);
+            if (existente is null)
+                await _repositorioPedidos.GuardarNuevoAsync(pedido, token);
+            else
+                await _repositorioPedidos.ActualizarAsync(pedido, token);
+
+            foreach (var (sku, cantidadRequerida) in requerimientos)
+            {
+                var prod = await _repositorioCatalogo.ObtenerPorSkuAsync(sku, token);
+                int nuevoStock = prod!.StockDisponible - cantidadRequerida;
+                await _repositorioCatalogo.ActualizarStockAsync(
+                    sku,
+                    nuevoStock,
+                    -cantidadRequerida,
+                    $"VENTA_{pedido.Codigo}",
+                    pedido.Codigo,
+                    token);
+            }
+
+            await _repositorioPedidos.RegistrarPagoAprobadoAsync(
+                pedido.Id,
+                claveIdempotencia,
+                cobro.ReferenciaTransaccion,
+                cobro.Proveedor,
+                pedido.Total,
+                token);
+
+            await _auditoriaOutbox.RegistrarAuditoriaAsync(
+                "PEDIDO",
+                "CONFIRMAR_PEDIDO",
+                $"Pedido {pedido.Codigo} pagado por ${pedido.Total:0.00} (Ref: {cobro.ReferenciaTransaccion})",
+                usuario,
+                claveIdempotencia,
+                token);
+
+            string payload = JsonSerializer.Serialize(new
+            {
+                pedido.Id,
+                pedido.Codigo,
+                pedido.ClienteId,
+                pedido.NombreCliente,
+                pedido.Total,
+                cobro.ReferenciaTransaccion,
+                Guia = guiaGenerada
+            });
+
+            await _auditoriaOutbox.AgregarEventoOutboxAsync(
+                "PedidoConfirmado",
+                payload,
+                $"OUTBOX-CONF-{claveIdempotencia}",
+                token);
+        }, ct);
+
+        _metricas.RegistrarPedidoConfirmado(pedido.Total);
+
+        return new ResultadoConfirmacionPedido(
+            true,
+            $"Pedido {pedido.Codigo} confirmado y pagado correctamente",
+            pedido.Id,
+            pedido.Codigo,
+            pedido.Total,
+            cobro.ReferenciaTransaccion,
+            guiaGenerada);
+    }
+}
