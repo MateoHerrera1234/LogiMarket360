@@ -10,8 +10,4 @@
     <ProjectReference Include="..\LogiMarket.Domain\LogiMarket.Domain.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Folder Include="Servicios\" />
-  </ItemGroup>
-
 </Project>
