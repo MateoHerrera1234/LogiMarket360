@@ -2,6 +2,8 @@
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Security.Cryptography;
+using System.Text;
 using LogiMarket.Application.Puertos;
 using LogiMarket.Domain.Enums;
 using Microsoft.Data.Sqlite;
@@ -11,6 +13,7 @@ namespace LogiMarket.Infrastructure.Persistencia;
 // Gestiona la conexion SQLite local, inicializacion de esquema y transacciones reales (Unit of Work)
 public sealed class ContextoSqliteLogiMarket : IUnidadTrabajo, IContextoSesion, IDisposable
 {
+    private const int IteracionesHash = 210_000;
     private readonly string _connectionString;
     private SqliteConnection? _conexionTransaccional;
     private SqliteTransaction? _transaccionActiva;
@@ -61,6 +64,33 @@ public sealed class ContextoSqliteLogiMarket : IUnidadTrabajo, IContextoSesion, 
         }
 
         return false;
+    }
+
+    public async Task<bool> IniciarSesionAsync(string nombreUsuario, string contrasena, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(nombreUsuario) || string.IsNullOrEmpty(contrasena))
+            return false;
+
+        await using var conexion = new SqliteConnection(_connectionString);
+        await conexion.OpenAsync(ct);
+        await using var cmd = conexion.CreateCommand();
+        cmd.CommandText = "SELECT Id, NombreUsuario, NombreCompleto, Rol, PasswordHash FROM Usuarios WHERE NombreUsuario = $usuario COLLATE NOCASE AND Activo = 1";
+        cmd.Parameters.AddWithValue("$usuario", nombreUsuario.Trim());
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return false;
+
+        string hashGuardado = reader.GetString(4);
+        if (!VerificarContrasena(contrasena, hashGuardado))
+            return false;
+
+        var usuario = new UsuarioSesion(
+            Guid.Parse(reader.GetString(0)),
+            reader.GetString(1),
+            reader.GetString(2),
+            Enum.Parse<RolUsuario>(reader.GetString(3), ignoreCase: true));
+        IniciarSesion(usuario);
+        return true;
     }
 
     public async Task<SqliteConnection> ObtenerConexionAbiertaAsync(CancellationToken ct = default)
@@ -131,6 +161,7 @@ CREATE TABLE IF NOT EXISTS Usuarios (
     NombreUsuario TEXT NOT NULL UNIQUE,
     NombreCompleto TEXT NOT NULL,
     Rol TEXT NOT NULL,
+    PasswordHash TEXT NOT NULL,
     Activo INTEGER NOT NULL DEFAULT 1
 );
 
@@ -263,37 +294,107 @@ CREATE TABLE IF NOT EXISTS EventosOutbox (
         cmd.CommandText = sql;
         await cmd.ExecuteNonQueryAsync(ct);
 
+        // Add the credential column to databases created by earlier project versions.
+        await using (var columnas = conexion.CreateCommand())
+        {
+            columnas.CommandText = "PRAGMA table_info(Usuarios)";
+            await using var reader = await columnas.ExecuteReaderAsync(ct);
+            bool tieneHash = false;
+            while (await reader.ReadAsync(ct))
+                tieneHash |= string.Equals(reader.GetString(1), "PasswordHash", StringComparison.OrdinalIgnoreCase);
+            if (!tieneHash)
+            {
+                await reader.DisposeAsync();
+                await using var alterar = conexion.CreateCommand();
+                alterar.CommandText = "ALTER TABLE Usuarios ADD COLUMN PasswordHash TEXT NOT NULL DEFAULT ''";
+                await alterar.ExecuteNonQueryAsync(ct);
+            }
+        }
+
         await SembrarDatosInicialesAsync(conexion, ct);
     }
 
     private static async Task SembrarDatosInicialesAsync(SqliteConnection conexion, CancellationToken ct)
     {
-        string seedSql = @"
-INSERT OR IGNORE INTO Usuarios (Id, NombreUsuario, NombreCompleto, Rol, Activo) VALUES
-    ('11111111-1111-1111-1111-111111111101', 'admin', 'Administrador General', 'ADMIN', 1),
-    ('11111111-1111-1111-1111-111111111102', 'vendedor1', 'Ejecutivo de Ventas', 'VENTAS', 1),
-    ('11111111-1111-1111-1111-111111111103', 'bodega1', 'Encargado de Bodega', 'BODEGA', 1),
-    ('11111111-1111-1111-1111-111111111104', 'consulta1', 'Analista de Consulta', 'CONSULTA', 1);
+        string[][] usuarios =
+        [
+            ["11111111-1111-1111-1111-111111111101", "admin", "Administrador", "ADMIN", "Admin-LM360-2026!"],
+            ["11111111-1111-1111-1111-111111111102", "vendedor1", "Ventas", "VENTAS", "Ventas-LM360-2026!"],
+            ["11111111-1111-1111-1111-111111111103", "bodega1", "Bodega", "BODEGA", "Bodega-LM360-2026!"],
+            ["11111111-1111-1111-1111-111111111104", "consulta1", "Consulta", "CONSULTA", "Consulta-LM360-2026!"]
+        ];
 
+        foreach (var u in usuarios)
+        {
+            string passwordHash = CrearHashContrasena(u[4]);
+            await using var cmdUsuario = conexion.CreateCommand();
+            cmdUsuario.CommandText = "INSERT OR IGNORE INTO Usuarios (Id, NombreUsuario, NombreCompleto, Rol, PasswordHash, Activo) VALUES ($id, $usuario, $nombre, $rol, $hash, 1)";
+            cmdUsuario.Parameters.AddWithValue("$id", u[0]);
+            cmdUsuario.Parameters.AddWithValue("$usuario", u[1]);
+            cmdUsuario.Parameters.AddWithValue("$nombre", u[2]);
+            cmdUsuario.Parameters.AddWithValue("$rol", u[3]);
+            cmdUsuario.Parameters.AddWithValue("$hash", passwordHash);
+            await cmdUsuario.ExecuteNonQueryAsync(ct);
+
+            // Upgrade old demo rows that were originally seeded without credentials.
+            await using var cmdActualizar = conexion.CreateCommand();
+            cmdActualizar.CommandText = "UPDATE Usuarios SET PasswordHash = $hash WHERE NombreUsuario = $usuario AND PasswordHash = ''";
+            cmdActualizar.Parameters.AddWithValue("$hash", passwordHash);
+            cmdActualizar.Parameters.AddWithValue("$usuario", u[1]);
+            await cmdActualizar.ExecuteNonQueryAsync(ct);
+        }
+
+        string seedSql = @"
 INSERT OR IGNORE INTO Clientes (Id, Codigo, Nombre, Contacto, Categoria, Activo) VALUES
-    ('22222222-2222-2222-2222-222222222201', 'CLI-001', 'Comercial Andina S.A.', 'compras@comercialandina.ec', 'MAYORISTA', 1),
-    ('22222222-2222-2222-2222-222222222202', 'CLI-002', 'Estudio Creativo Sur', 'hola@estudiosur.ec', 'VIP', 1),
-    ('22222222-2222-2222-2222-222222222203', 'CLI-003', 'Javier Vargas', 'jvargas@ejemplo.ec', 'NORMAL', 1);
+    ('22222222-2222-2222-2222-222222222201', 'CLI-ANA', 'Ana', 'ana@example.test', 'VIP', 1),
+    ('22222222-2222-2222-2222-222222222202', 'CLI-LUIS', 'Luis', 'luis@example.test', 'NORMAL', 1),
+    ('22222222-2222-2222-2222-222222222203', 'CLI-CARMEN', 'Carmen', 'carmen@example.test', 'MAYORISTA', 1);
 
 INSERT OR IGNORE INTO CatalogoElementos (Sku, Nombre, TipoElemento, PrecioUnitario, PesoKg, StockDisponible, StockMinimo, Activo) VALUES
-    ('SKU-MOU', 'Mouse Inalambrico Ergonomico', 'SIMPLE', 18.50, 0.15, 60, 10, 1),
-    ('SKU-TEC', 'Teclado Mecanico Compacto', 'SIMPLE', 42.00, 0.65, 45, 8, 1),
-    ('SKU-HUB', 'Hub USB-C Multipuerto', 'SIMPLE', 24.00, 0.20, 50, 10, 1),
-    ('KIT_TELETRABAJO', 'Kit Teletrabajo Esencial', 'KIT', 79.00, 1.00, 0, 0, 1);
+    ('P01', 'Mouse USB', 'SIMPLE', 20.00, 0.20, 8, 2, 1),
+    ('P02', 'Teclado', 'SIMPLE', 30.00, 0.70, 5, 2, 1),
+    ('P03', 'Memoria USB', 'SIMPLE', 10.00, 0.10, 20, 5, 1),
+    ('P04', 'Webcam', 'SIMPLE', 40.00, 0.35, 4, 1, 1),
+    ('P05', 'Alfombrilla', 'SIMPLE', 5.00, 0.10, 30, 5, 1),
+    ('KIT_OFICINA', 'Kit Oficina', 'KIT', 50.00, 0, 0, 0, 1),
+    ('KIT_TELETRABAJO', 'Kit Teletrabajo', 'KIT', 60.00, 0, 0, 0, 1);
 
 INSERT OR IGNORE INTO KitComponentes (KitSku, ComponenteSku, Cantidad) VALUES
-    ('KIT_TELETRABAJO', 'SKU-MOU', 1),
-    ('KIT_TELETRABAJO', 'SKU-TEC', 1),
-    ('KIT_TELETRABAJO', 'SKU-HUB', 1);";
+    ('KIT_OFICINA', 'P01', 1),
+    ('KIT_OFICINA', 'P02', 1),
+    ('KIT_TELETRABAJO', 'KIT_OFICINA', 1),
+    ('KIT_TELETRABAJO', 'P03', 1);";
 
         await using var cmd = conexion.CreateCommand();
         cmd.CommandText = seedSql;
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static string CrearHashContrasena(string contrasena)
+    {
+        byte[] sal = RandomNumberGenerator.GetBytes(16);
+        byte[] hash = Rfc2898DeriveBytes.Pbkdf2(contrasena, sal, IteracionesHash, HashAlgorithmName.SHA256, 32);
+        return $"PBKDF2-SHA256${IteracionesHash}${Convert.ToBase64String(sal)}${Convert.ToBase64String(hash)}";
+    }
+
+    private static bool VerificarContrasena(string contrasena, string formato)
+    {
+        string[] partes = formato.Split('$');
+        if (partes.Length != 4 || partes[0] != "PBKDF2-SHA256" ||
+            !int.TryParse(partes[1], out int iteraciones) || iteraciones < 100_000)
+            return false;
+
+        try
+        {
+            byte[] sal = Convert.FromBase64String(partes[2]);
+            byte[] hashEsperado = Convert.FromBase64String(partes[3]);
+            byte[] hashReal = Rfc2898DeriveBytes.Pbkdf2(contrasena, sal, iteraciones, HashAlgorithmName.SHA256, hashEsperado.Length);
+            return CryptographicOperations.FixedTimeEquals(hashEsperado, hashReal);
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
     }
 
     public void Dispose()

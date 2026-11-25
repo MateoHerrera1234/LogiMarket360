@@ -76,14 +76,6 @@ public sealed class ConfirmarPedidoCommand : IComandoLogiMarket
         if (!confirmacion.Exitoso)
             return new ResultadoComando(false, confirmacion.Mensaje);
 
-        await _publicador.PublicarEventoAsync(new EventoSistemaLogiMarket(
-            "PEDIDO_CONFIRMADO",
-            _pedido.Codigo,
-            _pedido.NombreCliente,
-            _pedido.Total,
-            $"Pedido {_pedido.Codigo} confirmado. Guia: {confirmacion.NumeroGuia}",
-            DateTime.UtcNow), ct);
-
         return new ResultadoComando(true, confirmacion.Mensaje, confirmacion.NumeroGuia);
     }
 }
@@ -209,12 +201,62 @@ public sealed class DespacharPedidoCommand : IComandoLogiMarket
                 token);
             await _auditoriaOutbox.AgregarEventoOutboxAsync(
                 "PedidoDespachado",
-                JsonSerializer.Serialize(new { pedido.Id, pedido.Codigo, Guia = guia, PlazoDias = plazo }),
+                JsonSerializer.Serialize(new { pedido.Id, pedido.Codigo, pedido.NombreCliente, Total = pedido.Total, Guia = guia, PlazoDias = plazo }),
                 $"OUTBOX-DESP-{pedido.Id:N}",
                 token);
         }, ct);
 
         return new ResultadoComando(true, $"Pedido {pedido.Codigo} despachado", guia);
+    }
+}
+
+// Command de entrega: conserva la autorización y la transición dentro de Application.
+public sealed class EntregarPedidoCommand : IComandoLogiMarket
+{
+    private readonly Guid _pedidoId;
+    private readonly IRepositorioPedidos _pedidos;
+    private readonly IRepositorioAuditoriaOutbox _auditoria;
+    private readonly IUnidadTrabajo _unidadTrabajo;
+    private readonly IContextoSesion _sesion;
+    private readonly PublicadorEventosSistema _publicador;
+
+    public string NombreComando => "ENTREGAR_PEDIDO";
+
+    public EntregarPedidoCommand(Guid pedidoId, IRepositorioPedidos pedidos, IRepositorioAuditoriaOutbox auditoria,
+        IUnidadTrabajo unidadTrabajo, IContextoSesion sesion, PublicadorEventosSistema publicador)
+    {
+        _pedidoId = pedidoId;
+        _pedidos = pedidos ?? throw new ArgumentNullException(nameof(pedidos));
+        _auditoria = auditoria ?? throw new ArgumentNullException(nameof(auditoria));
+        _unidadTrabajo = unidadTrabajo ?? throw new ArgumentNullException(nameof(unidadTrabajo));
+        _sesion = sesion ?? throw new ArgumentNullException(nameof(sesion));
+        _publicador = publicador ?? throw new ArgumentNullException(nameof(publicador));
+    }
+
+    public async Task<ResultadoComando> EjecutarAsync(CancellationToken ct = default)
+    {
+        if (!_sesion.TienePermiso(RolUsuario.BODEGA, RolUsuario.ADMIN))
+            return new ResultadoComando(false, "Solo BODEGA o ADMIN pueden registrar entregas");
+
+        var pedido = await _pedidos.ObtenerPorIdAsync(_pedidoId, ct);
+        if (pedido is null)
+            return new ResultadoComando(false, "Pedido no encontrado");
+
+        try { pedido.MarcarComoEntregado(DateTime.UtcNow); }
+        catch (InvalidOperationException ex) { return new ResultadoComando(false, ex.Message); }
+
+        string usuario = _sesion.UsuarioActual?.NombreUsuario ?? "SISTEMA";
+        await _unidadTrabajo.EjecutarEnTransaccionAsync(async token =>
+        {
+            await _pedidos.ActualizarAsync(pedido, token);
+            await _auditoria.RegistrarAuditoriaAsync("DESPACHO", "ENTREGAR_PEDIDO",
+                $"Pedido {pedido.Codigo} registrado como entregado", usuario, pedido.Id.ToString(), token);
+            await _auditoria.AgregarEventoOutboxAsync("PedidoEntregado",
+                JsonSerializer.Serialize(new { pedido.Id, pedido.Codigo, pedido.NombreCliente, Total = pedido.Total, pedido.FechaEntregaUtc }),
+                $"OUTBOX-ENT-{pedido.Id:N}", token);
+        }, ct);
+
+        return new ResultadoComando(true, $"Pedido {pedido.Codigo} registrado como entregado");
     }
 }
 
@@ -320,6 +362,8 @@ public sealed class ProcesarDevolucionCommand : IComandoLogiMarket
                 _observacion,
                 token);
 
+            await _repositorioPedidos.ActualizarAsync(pedido, token);
+
             await _auditoriaOutbox.RegistrarAuditoriaAsync(
                 "DEVOLUCION",
                 "PROCESAR_DEVOLUCION",
@@ -330,18 +374,10 @@ public sealed class ProcesarDevolucionCommand : IComandoLogiMarket
 
             await _auditoriaOutbox.AgregarEventoOutboxAsync(
                 "DevolucionProcesada",
-                JsonSerializer.Serialize(new { pedido.Id, pedido.Codigo, Motivo = _motivo.ToString(), resultado.MontoReembolso }),
+                JsonSerializer.Serialize(new { pedido.Id, pedido.Codigo, pedido.NombreCliente, Total = resultado.MontoReembolso, Motivo = _motivo.ToString() }),
                 $"OUTBOX-DEV-{pedido.Id:N}",
                 token);
         }, ct);
-
-        await _publicador.PublicarEventoAsync(new EventoSistemaLogiMarket(
-            "DEVOLUCION_PROCESADA",
-            pedido.Codigo,
-            pedido.NombreCliente,
-            resultado.MontoReembolso,
-            $"Reembolso aprobado por ${resultado.MontoReembolso:0.00} (sin tarifa de envio)",
-            DateTime.UtcNow), ct);
 
         return new ResultadoComando(true, $"{resultado.Mensaje}. Reembolso: ${resultado.MontoReembolso:0.00}");
     }

@@ -70,7 +70,7 @@ public sealed class ObservadorMetricasSesion : IObservadorEventoSistema
 
     public Task AlRecibirEventoAsync(EventoSistemaLogiMarket evento, CancellationToken ct = default)
     {
-        if (evento.TipoEvento == "DEVOLUCION_PROCESADA")
+        if (evento.TipoEvento is "DEVOLUCION_PROCESADA" or "DevolucionProcesada")
             _metricas.RegistrarDevolucionProcesada();
 
         return Task.CompletedTask;

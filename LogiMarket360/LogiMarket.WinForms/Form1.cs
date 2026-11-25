@@ -7,19 +7,25 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using LogiMarket.Application.Comportamentales;
 using LogiMarket.Application.Creacionales;
+using LogiMarket.Application.Estructurales;
+using LogiMarket.Application.Puertos;
 using LogiMarket.Domain.Catalogo;
 using LogiMarket.Domain.Clientes;
 using LogiMarket.Domain.Enums;
 using LogiMarket.Domain.Pedidos;
 using LogiMarket.WinForms.Coordinacion;
+using LogiMarket.Infrastructure.Documentos;
 
 namespace LogiMarket.WinForms;
 
 public partial class Form1 : Form
 {
-    private readonly CoordinadorLogiMarketWinForms _coord = new();
+    private readonly CoordinadorLogiMarketWinForms _coord;
+    private FormularioPrincipalMediator _mediador = null!;
 
-    private ComboBox _cmbRol = null!;
+    private TextBox _txtUsuario = null!;
+    private TextBox _txtContrasena = null!;
+    private TabControl _tabs = null!;
     private Label _lblMetricas = null!;
 
     // Catalogo y Kits
@@ -58,6 +64,7 @@ public partial class Form1 : Form
     private ComboBox _cmbPedidoOp = null!;
     private ComboBox _cmbMotivoDev = null!;
     private TextBox _txtObsDev = null!;
+    private CheckBox _chkProductoSinUso = null!;
     private TextBox _txtBitacoraOp = null!;
 
     // Auditoria y Outbox
@@ -65,12 +72,19 @@ public partial class Form1 : Form
     private DataGridView _dgvMovimientos = null!;
     private Label _lblOutboxPendientes = null!;
 
-    public Form1()
+    public Form1(CoordinadorLogiMarketWinForms coord)
     {
+        _coord = coord ?? throw new ArgumentNullException(nameof(coord));
         InitializeComponent();
         ConfigurarInterfaz();
+        _mediador = new FormularioPrincipalMediator(
+            RefrescarCatalogoAsync,
+            RefrescarClientesAsync,
+            RefrescarPedidosAsync,
+            RefrescarAuditoriaAsync,
+            RefrescarBorradorVisual,
+            ActualizarBarraEstado);
         Load += Form1_Load;
-        FormClosed += (_, _) => _coord.Dispose();
     }
 
     private void ConfigurarInterfaz()
@@ -79,31 +93,26 @@ public partial class Form1 : Form
         Size = new Size(1240, 760);
         StartPosition = FormStartPosition.CenterScreen;
 
-        var barraSuperior = new Panel { Dock = DockStyle.Top, Height = 44, BackColor = Color.FromArgb(240, 244, 248), Padding = new Padding(10, 8, 10, 8) };
-        var lblRol = new Label { Text = "Rol activo:", AutoSize = true, Location = new Point(12, 13), Font = new Font(Font, FontStyle.Bold) };
-        _cmbRol = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(88, 9), Width = 140 };
-        _cmbRol.Items.AddRange(new object[] { RolUsuario.ADMIN, RolUsuario.VENTAS, RolUsuario.BODEGA, RolUsuario.CONSULTA });
-        _cmbRol.SelectedIndex = 0;
-        _cmbRol.SelectedIndexChanged += (_, _) =>
-        {
-            if (_cmbRol.SelectedItem is RolUsuario rol)
-            {
-                _coord.CambiarRolDemo(rol);
-                ActualizarBarraEstado();
-            }
-        };
+        var barraSuperior = new Panel { Dock = DockStyle.Top, Height = 52, BackColor = Color.FromArgb(240, 244, 248), Padding = new Padding(10, 8, 10, 8) };
+        var lblAcceso = new Label { Text = "Acceso:", AutoSize = true, Location = new Point(12, 16), Font = new Font(Font, FontStyle.Bold) };
+        _txtUsuario = new TextBox { Location = new Point(78, 11), Width = 125, Text = "admin", AccessibleName = "Usuario" };
+        _txtContrasena = new TextBox { Location = new Point(210, 11), Width = 150, UseSystemPasswordChar = true, AccessibleName = "Contraseña" };
+        var btnAcceso = new Button { Text = "Ingresar", Location = new Point(366, 9), Width = 85, Height = 28 };
+        btnAcceso.Click += async (_, _) => await IniciarSesionDesdeCamposAsync();
+        var btnCerrarSesion = new Button { Text = "Cerrar sesión", Location = new Point(456, 9), Width = 100, Height = 28 };
+        btnCerrarSesion.Click += async (_, _) => await CerrarSesionAsync();
 
-        _lblMetricas = new Label { AutoSize = true, Location = new Point(250, 13), Text = "Sesion iniciada" };
-        barraSuperior.Controls.AddRange(new Control[] { lblRol, _cmbRol, _lblMetricas });
+        _lblMetricas = new Label { AutoSize = true, Location = new Point(570, 16), Text = "Inicie sesión para continuar" };
+        barraSuperior.Controls.AddRange(new Control[] { lblAcceso, _txtUsuario, _txtContrasena, btnAcceso, btnCerrarSesion, _lblMetricas });
 
-        var tabs = new TabControl { Dock = DockStyle.Fill };
-        tabs.TabPages.Add(CrearTabCatalogo());
-        tabs.TabPages.Add(CrearTabClientes());
-        tabs.TabPages.Add(CrearTabPedidos());
-        tabs.TabPages.Add(CrearTabDespachoDevoluciones());
-        tabs.TabPages.Add(CrearTabAuditoria());
+        _tabs = new TabControl { Dock = DockStyle.Fill, Enabled = false };
+        _tabs.TabPages.Add(CrearTabCatalogo());
+        _tabs.TabPages.Add(CrearTabClientes());
+        _tabs.TabPages.Add(CrearTabPedidos());
+        _tabs.TabPages.Add(CrearTabDespachoDevoluciones());
+        _tabs.TabPages.Add(CrearTabAuditoria());
 
-        Controls.Add(tabs);
+        Controls.Add(_tabs);
         Controls.Add(barraSuperior);
     }
 
@@ -113,7 +122,7 @@ public partial class Form1 : Form
         var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 700 };
 
         _dgvCatalogo = CrearGridSoloLectura();
-        split.Panel1.Controls.Add(_dgvCatalogo);
+        split.Panel1.Controls.Add(CrearContenedorGrid(_dgvCatalogo));
 
         var panelDer = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(10) };
         int y = 10;
@@ -168,7 +177,7 @@ public partial class Form1 : Form
         var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 760 };
 
         _dgvClientes = CrearGridSoloLectura();
-        split.Panel1.Controls.Add(_dgvClientes);
+        split.Panel1.Controls.Add(CrearContenedorGrid(_dgvClientes));
 
         var panelDer = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10) };
         int y = 10;
@@ -249,15 +258,16 @@ public partial class Form1 : Form
         _lblTotalBorrador = new Label { Text = "Subtotal borrador: $0.00", Location = new Point(830, 50), AutoSize = true, Font = new Font(Font, FontStyle.Bold) };
 
         _dgvBorrador = CrearGridSoloLectura();
-        _dgvBorrador.Location = new Point(10, 82);
-        _dgvBorrador.Size = new Size(1180, 220);
-        _dgvBorrador.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        var contenedorBorrador = CrearContenedorGrid(_dgvBorrador);
+        contenedorBorrador.Location = new Point(10, 82);
+        contenedorBorrador.Size = new Size(1180, 220);
+        contenedorBorrador.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
         sup.Controls.AddRange(new Control[]
         {
             _cmbPedidoCliente, _cmbPedidoEntrega, _cmbPedidoElemento, _numPedidoCant,
             btnAgregarItem, btnDeshacer, btnRehacer, _txtClaveIdempotencia, btnConfirmar,
-            _lblTotalBorrador, _dgvBorrador
+            _lblTotalBorrador, contenedorBorrador
         });
         split.Panel1.Controls.Add(sup);
 
@@ -275,11 +285,12 @@ public partial class Form1 : Form
         btnExportarTxt.Click += async (_, _) => await ExportarResumenPedidoAsync();
 
         _dgvPedidos = CrearGridSoloLectura();
-        _dgvPedidos.Location = new Point(10, 42);
-        _dgvPedidos.Size = new Size(1180, 290);
-        _dgvPedidos.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        var contenedorPedidos = CrearContenedorGrid(_dgvPedidos);
+        contenedorPedidos.Location = new Point(10, 42);
+        contenedorPedidos.Size = new Size(1180, 290);
+        contenedorPedidos.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
-        inf.Controls.AddRange(new Control[] { _txtFiltroPedidos, btnFiltrar, btnClonar, btnExportarTxt, _dgvPedidos });
+        inf.Controls.AddRange(new Control[] { _txtFiltroPedidos, btnFiltrar, btnClonar, btnExportarTxt, contenedorPedidos });
         split.Panel2.Controls.Add(inf);
 
         page.Controls.Add(split);
@@ -309,9 +320,11 @@ public partial class Form1 : Form
         _cmbMotivoDev.SelectedIndex = 0;
 
         panel.Controls.Add(new Label { Text = "Observacion:", Location = new Point(365, 64), AutoSize = true });
-        _txtObsDev = new TextBox { Location = new Point(450, 60), Width = 280, Text = "Revision en recepcion" };
+        _txtObsDev = new TextBox { Location = new Point(450, 60), Width = 210, Text = "Revision en recepcion" };
 
-        var btnDevolver = new Button { Text = "Registrar Devolucion", Location = new Point(745, 59), Width = 220, Height = 28 };
+        _chkProductoSinUso = new CheckBox { Text = "Producto sin uso", Location = new Point(670, 63), Width = 130, Checked = true };
+
+        var btnDevolver = new Button { Text = "Registrar Devolucion", Location = new Point(810, 59), Width = 220, Height = 28 };
         btnDevolver.Click += async (_, _) => await ProcesarDevolucionAsync();
 
         _txtBitacoraOp = new TextBox { Location = new Point(15, 105), Size = new Size(1160, 520), Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
@@ -320,7 +333,7 @@ public partial class Form1 : Form
         panel.Controls.AddRange(new Control[]
         {
             _cmbPedidoOp, btnDespachar, btnEntregar, btnCancelar,
-            _cmbMotivoDev, _txtObsDev, btnDevolver, _txtBitacoraOp
+            _cmbMotivoDev, _txtObsDev, _chkProductoSinUso, btnDevolver, _txtBitacoraOp
         });
         page.Controls.Add(panel);
         return page;
@@ -341,15 +354,16 @@ public partial class Form1 : Form
         _lblOutboxPendientes = new Label { Text = "Outbox pendiente: 0", Location = new Point(440, 14), AutoSize = true, Font = new Font(Font, FontStyle.Bold) };
 
         _dgvAuditoria = CrearGridSoloLectura();
-        _dgvAuditoria.Location = new Point(10, 44);
-        _dgvAuditoria.Size = new Size(1180, 260);
-        _dgvAuditoria.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        var contenedorAuditoria = CrearContenedorGrid(_dgvAuditoria);
+        contenedorAuditoria.Location = new Point(10, 44);
+        contenedorAuditoria.Size = new Size(1180, 260);
+        contenedorAuditoria.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
-        top.Controls.AddRange(new Control[] { btnRefrescar, btnProcesarOutbox, _lblOutboxPendientes, _dgvAuditoria });
+        top.Controls.AddRange(new Control[] { btnRefrescar, btnProcesarOutbox, _lblOutboxPendientes, contenedorAuditoria });
         split.Panel1.Controls.Add(top);
 
         _dgvMovimientos = CrearGridSoloLectura();
-        split.Panel2.Controls.Add(_dgvMovimientos);
+        split.Panel2.Controls.Add(CrearContenedorGrid(_dgvMovimientos));
 
         page.Controls.Add(split);
         return page;
@@ -360,8 +374,7 @@ public partial class Form1 : Form
         try
         {
             await _coord.InicializarAsync();
-            await DatosInicialesDemo.CargarSiVacioAsync(_coord);
-            await RefrescarTodoAsync();
+            await MostrarDialogoAccesoAsync();
         }
         catch (Exception ex)
         {
@@ -369,20 +382,59 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task RefrescarTodoAsync()
+    private async Task MostrarDialogoAccesoAsync()
     {
-        await RefrescarCatalogoAsync();
-        await RefrescarClientesAsync();
-        await RefrescarPedidosAsync();
-        await RefrescarAuditoriaAsync();
-        RefrescarBorradorVisual();
-        ActualizarBarraEstado();
+        while (!_coord.ContextoSqlite.TienePermiso(RolUsuario.ADMIN, RolUsuario.VENTAS, RolUsuario.BODEGA, RolUsuario.CONSULTA))
+        {
+            using var dialogo = new LoginDialog();
+            if (dialogo.ShowDialog(this) != DialogResult.OK)
+            {
+                Close();
+                return;
+            }
+
+            bool ingreso = await _coord.ContextoSqlite.IniciarSesionAsync(dialogo.NombreUsuario, dialogo.Contrasena);
+            if (!ingreso)
+            {
+                MessageBox.Show(this, "Usuario o contraseña incorrectos.", "Acceso denegado", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                continue;
+            }
+        }
+
+        _tabs.Enabled = true;
+        await RefrescarTodoAsync();
     }
+
+    private async Task IniciarSesionDesdeCamposAsync()
+    {
+        bool ingreso = await _coord.ContextoSqlite.IniciarSesionAsync(_txtUsuario.Text, _txtContrasena.Text);
+        if (!ingreso)
+        {
+            MessageBox.Show(this, "Usuario o contraseña incorrectos.", "Acceso denegado", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _txtContrasena.Clear();
+        _tabs.Enabled = true;
+        await RefrescarTodoAsync();
+    }
+
+    private async Task CerrarSesionAsync()
+    {
+        _coord.ContextoSqlite.CerrarSesion();
+        _tabs.Enabled = false;
+        ActualizarBarraEstado();
+        await MostrarDialogoAccesoAsync();
+    }
+
+    private Task RefrescarTodoAsync() => _mediador.NotificarOperacionActualizadaAsync();
 
     private void ActualizarBarraEstado()
     {
         var sesion = _coord.ContextoSqlite.UsuarioActual;
-        _lblMetricas.Text = $"Usuario: {sesion?.NombreCompleto} ({sesion?.Rol}) | Pedidos sesion: {_coord.Metricas.PedidosConfirmadosSesion} | Total facturado: ${_coord.Metricas.TotalFacturadoSesionUsd:F2}";
+        _lblMetricas.Text = sesion is null
+            ? "Sesión cerrada"
+            : $"Usuario: {sesion.NombreCompleto} ({sesion.Rol}) | Pedidos sesión: {_coord.Metricas.PedidosConfirmadosSesion} | Total facturado: ${_coord.Metricas.TotalFacturadoSesionUsd:F2}";
     }
 
     private async Task RefrescarCatalogoAsync()
@@ -393,6 +445,7 @@ public partial class Form1 : Form
             e.Sku,
             e.Nombre,
             Tipo = e is KitCompuesto ? "KIT" : "SIMPLE",
+            MetadatoVisual = _coord.MetadatosVisuales.Obtener(e is KitCompuesto ? "KIT" : "SIMPLE").EtiquetaCorta,
             PrecioUsd = e.PrecioUnitario,
             PesoKg = e.PesoKg,
             e.StockDisponible
@@ -515,7 +568,7 @@ public partial class Form1 : Form
         try
         {
             var prod = new ProductoSimple(_txtSku.Text, _txtNombreProd.Text, _numPrecio.Value, _numPeso.Value, (int)_numStock.Value);
-            await _coord.Catalogo.GuardarProductoAsync(prod);
+            await _coord.Administracion.GuardarProductoAsync(prod);
             await _coord.AuditoriaOutbox.RegistrarAuditoriaAsync("CATALOGO", "GUARDAR_PRODUCTO", $"SKU {prod.Sku} guardado", _coord.ContextoSqlite.UsuarioActual?.NombreUsuario ?? "sistema");
             await RefrescarTodoAsync();
         }
@@ -541,7 +594,7 @@ public partial class Form1 : Form
                 ?? new KitCompuesto(_txtKitSku.Text, _txtKitNombre.Text, _numKitPrecio.Value);
 
             kit.AgregarComponente(componente, (int)_numCompCant.Value);
-            await _coord.Catalogo.GuardarKitAsync(kit);
+            await _coord.Administracion.GuardarKitAsync(kit);
             await _coord.AuditoriaOutbox.RegistrarAuditoriaAsync("CATALOGO", "ACTUALIZAR_KIT", $"Componente {componente.Sku} agregado a {kit.Sku}", _coord.ContextoSqlite.UsuarioActual?.NombreUsuario ?? "sistema");
             await RefrescarTodoAsync();
         }
@@ -564,14 +617,26 @@ public partial class Form1 : Form
         if (el is null)
             return;
 
-        var expansion = el.ExpandirCantidadesPorSku(1);
+        var desglose = new VisitanteDesgloseFisico();
+        var peso = new VisitantePesoLogistico();
+        if (el is KitCompuesto kit)
+        {
+            desglose.VisitarKit(kit, 1);
+            peso.VisitarKit(kit, 1);
+        }
+        else if (el is ProductoSimple producto)
+        {
+            desglose.VisitarProducto(producto, 1);
+            peso.VisitarProducto(producto, 1);
+        }
+
         var lineas = new List<string>
         {
             $"Elemento: {el.Sku} - {el.Nombre}",
-            $"Precio Unitario: ${el.PrecioUnitario:F2} | Peso: {el.PesoKg:F2} kg | Stock armado: {el.StockDisponible}",
+            $"Precio Unitario: ${el.PrecioUnitario:F2} | Peso: {peso.PesoTotalKg:F2} kg | Stock armado: {el.StockDisponible}",
             "Expansion real de SKUs hoja:"
         };
-        foreach (var par in expansion)
+        foreach (var par in desglose.ObtenerDesglose())
             lineas.Add($"  - {par.Key}: {par.Value} unidad(es)");
 
         _txtResumenVisitor.Text = string.Join(Environment.NewLine, lineas);
@@ -585,7 +650,7 @@ public partial class Form1 : Form
                 return;
 
             var cli = new Cliente(Guid.NewGuid(), _txtCliCodigo.Text, _txtCliNombre.Text, _txtCliContacto.Text, cat, true);
-            await _coord.Clientes.GuardarAsync(cli);
+            await _coord.Administracion.GuardarClienteAsync(cli);
             await _coord.AuditoriaOutbox.RegistrarAuditoriaAsync("CLIENTES", "GUARDAR_CLIENTE", $"Cliente {cli.Codigo} registrado", _coord.ContextoSqlite.UsuarioActual?.NombreUsuario ?? "sistema");
             await RefrescarTodoAsync();
         }
@@ -680,20 +745,21 @@ public partial class Form1 : Form
         if (pedido is null)
             return;
 
-        string carpeta = Path.Combine(AppContext.BaseDirectory, "Comprobantes");
-        Directory.CreateDirectory(carpeta);
-        string ruta = Path.Combine(carpeta, $"{pedido.Codigo}.txt");
+        var opcion = MessageBox.Show(this,
+            "Sí: guardar comprobante TXT. No: mostrar vista previa.",
+            "Salida del comprobante (Bridge)", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (opcion == DialogResult.Cancel)
+            return;
 
-        string contenido = string.Join(Environment.NewLine, new[]
-        {
-            $"PEDIDO: {pedido.Codigo}",
-            $"CLIENTE: {pedido.NombreCliente} ({pedido.CategoriaCliente})",
-            $"ESTADO: {pedido.Estado} | ENTREGA: {pedido.TipoEntrega}",
-            $"SUBTOTAL: ${pedido.Subtotal:F2} | DESCUENTO: ${pedido.Descuento:F2} | ENVIO: ${pedido.TarifaEnvio:F2} | TOTAL: ${pedido.Total:F2}"
-        });
-
-        await File.WriteAllTextAsync(ruta, contenido);
-        MessageBox.Show(this, $"Resumen exportado en:{Environment.NewLine}{ruta}", "Resumen Pedido", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        var pago = await _coord.Pedidos.ObtenerPagoPorPedidoAsync(pedido.Id);
+        ISalidaDocumento salida = opcion == DialogResult.Yes
+            ? _coord.SalidaComprobante
+            : new SalidaTextoMemoria();
+        var comprobante = new ComprobanteVenta(salida, pedido, pago?.ReferenciaPasarela ?? "PENDIENTE");
+        string contenidoSalida = await comprobante.EmitirAsync();
+        MessageBox.Show(this, contenidoSalida,
+            opcion == DialogResult.Yes ? "Comprobante exportado" : "Vista previa del comprobante",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private async Task EjecutarCambioEstadoAsync(string accion)
@@ -703,31 +769,22 @@ public partial class Form1 : Form
             if (_cmbPedidoOp.SelectedItem is not OpcionCombo sel)
                 return;
 
-            var pedido = await _coord.Pedidos.ObtenerPorIdAsync(Guid.Parse(sel.Clave));
-            if (pedido is null)
-                return;
-
-            await _coord.ContextoSqlite.EjecutarEnTransaccionAsync(async ct =>
+            Guid pedidoId = Guid.Parse(sel.Clave);
+            IComandoLogiMarket comando = accion switch
             {
-                if (accion == "DESPACHAR")
-                {
-                    pedido.MarcarComoDespachado();
-                    await _coord.Pedidos.RegistrarDespachoAsync(pedido.Id, $"GUIA-{DateTime.UtcNow:yyyyMMddHHmmss}", pedido.TipoEntrega.ToString(), pedido.PlazoEntregaDias, ct);
-                }
-                else if (accion == "ENTREGAR")
-                {
-                    pedido.MarcarComoEntregado(DateTime.UtcNow);
-                }
-                else if (accion == "CANCELAR")
-                {
-                    pedido.Cancelar();
-                }
+                "DESPACHAR" => new DespacharPedidoCommand(pedidoId, _coord.Pedidos, _coord.AuditoriaOutbox, _coord.ContextoSqlite, _coord.ContextoSqlite),
+                "ENTREGAR" => new EntregarPedidoCommand(pedidoId, _coord.Pedidos, _coord.AuditoriaOutbox, _coord.ContextoSqlite, _coord.ContextoSqlite, _coord.PublicadorEventos),
+                "CANCELAR" => new CancelarPedidoCommand(pedidoId, _coord.Pedidos, _coord.AuditoriaOutbox, _coord.ContextoSqlite, _coord.ContextoSqlite),
+                _ => throw new ArgumentOutOfRangeException(nameof(accion), "Operacion de pedido no reconocida")
+            };
+            var resultado = await _coord.Invocador.EjecutarAsync(comando);
+            if (!resultado.Exitoso)
+            {
+                MessageBox.Show(this, resultado.Mensaje, "Operacion denegada", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
-                await _coord.Pedidos.ActualizarAsync(pedido, ct);
-                await _coord.AuditoriaOutbox.RegistrarAuditoriaAsync("OPERACIONES", accion, $"Pedido {pedido.Codigo} -> {pedido.Estado}", _coord.ContextoSqlite.UsuarioActual?.NombreUsuario ?? "sistema", pedido.Id.ToString(), ct);
-            });
-
-            _txtBitacoraOp.AppendText($"[{DateTime.Now:HH:mm:ss}] {accion} ejecutado en {pedido.Codigo}. Estado actual: {pedido.Estado}{Environment.NewLine}");
+            _txtBitacoraOp.AppendText($"[{DateTime.Now:HH:mm:ss}] {accion}: {resultado.Mensaje}{Environment.NewLine}");
             await RefrescarTodoAsync();
         }
         catch (Exception ex)
@@ -743,38 +800,18 @@ public partial class Form1 : Form
             if (_cmbPedidoOp.SelectedItem is not OpcionCombo sel || _cmbMotivoDev.SelectedItem is not MotivoDevolucion motivo)
                 return;
 
-            var pedido = await _coord.Pedidos.ObtenerPorIdAsync(Guid.Parse(sel.Clave));
-            if (pedido is null)
-                return;
-
-            bool reintegraStock = motivo == MotivoDevolucion.ARREPENTIMIENTO;
-            decimal montoReembolso = pedido.Total;
-
-            await _coord.ContextoSqlite.EjecutarEnTransaccionAsync(async ct =>
+            var comando = new ProcesarDevolucionCommand(
+                Guid.Parse(sel.Clave), motivo, _chkProductoSinUso.Checked, _txtObsDev.Text, DateTime.UtcNow,
+                _coord.Pedidos, _coord.Catalogo, _coord.AuditoriaOutbox, _coord.ContextoSqlite,
+                _coord.ContextoSqlite, _coord.PublicadorEventos);
+            var resultado = await _coord.Invocador.EjecutarAsync(comando);
+            if (!resultado.Exitoso)
             {
-                if (reintegraStock)
-                {
-                    foreach (var linea in pedido.Lineas)
-                    {
-                        foreach (var comp in linea.ComponentesExpandidos)
-                        {
-                            var el = await _coord.Catalogo.ObtenerPorSkuAsync(comp.SkuFisico, ct);
-                            if (el is ProductoSimple prod)
-                            {
-                                prod.ReintegrarStock(comp.CantidadTotalFisica);
-                                await _coord.Catalogo.ActualizarStockAsync(prod.Sku, prod.StockDisponible, comp.CantidadTotalFisica, $"DEVOLUCION_{motivo}", pedido.Codigo, ct);
-                            }
-                        }
-                    }
-                }
+                MessageBox.Show(this, resultado.Mensaje, "Devolucion rechazada", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
-                pedido.MarcarDevolucionRegistrada();
-                await _coord.Pedidos.ActualizarAsync(pedido, ct);
-                await _coord.Pedidos.RegistrarDevolucionAsync(pedido.Id, motivo, montoReembolso, reintegraStock, _txtObsDev.Text, ct);
-                await _coord.AuditoriaOutbox.RegistrarAuditoriaAsync("DEVOLUCIONES", "PROCESAR_DEVOLUCION", $"Pedido {pedido.Codigo} | Motivo: {motivo} | Reembolso: ${montoReembolso:F2} | Reintegra stock: {reintegraStock}", _coord.ContextoSqlite.UsuarioActual?.NombreUsuario ?? "sistema", pedido.Id.ToString(), ct);
-            });
-
-            _txtBitacoraOp.AppendText($"[{DateTime.Now:HH:mm:ss}] Devolucion {pedido.Codigo} ({motivo}): Reembolso ${montoReembolso:F2}, Reintegra stock={reintegraStock}{Environment.NewLine}");
+            _txtBitacoraOp.AppendText($"[{DateTime.Now:HH:mm:ss}] {resultado.Mensaje}{Environment.NewLine}");
             await RefrescarTodoAsync();
         }
         catch (Exception ex)
@@ -785,14 +822,9 @@ public partial class Form1 : Form
 
     private async Task ProcesarOutboxPendienteAsync()
     {
-        var pendientes = await _coord.AuditoriaOutbox.ObtenerEventosOutboxPendientesAsync();
-        foreach (var ev in pendientes)
-        {
-            await _coord.AuditoriaOutbox.MarcarOutboxProcesadoAsync(ev.Id);
-        }
-
+        var resultado = await _coord.ProcesadorOutbox.ProcesarPendientesAsync();
         await RefrescarAuditoriaAsync();
-        MessageBox.Show(this, $"Se despacharon {pendientes.Count} evento(s) Outbox pendientes.", "Outbox Transaccional", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        MessageBox.Show(this, $"Procesados: {resultado.Procesados}. Fallidos pendientes de reintento: {resultado.Fallidos}.", "Outbox Transaccional", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private static DataGridView CrearGridSoloLectura() => new()
@@ -802,9 +834,119 @@ public partial class Form1 : Form
         AllowUserToAddRows = false,
         AllowUserToDeleteRows = false,
         SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+        AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
+        ScrollBars = ScrollBars.Vertical,
         MultiSelect = false
     };
+
+    private static TableLayoutPanel CrearContenedorGrid(DataGridView grid)
+    {
+        var barraHorizontal = new HScrollBar
+        {
+            Dock = DockStyle.Fill,
+            Height = Math.Max(18, SystemInformation.HorizontalScrollBarHeight),
+            Minimum = 0,
+            SmallChange = 40,
+            AccessibleName = "Desplazamiento horizontal"
+        };
+
+        var contenedor = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        contenedor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        contenedor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        contenedor.RowStyles.Add(new RowStyle(SizeType.Absolute, Math.Max(18, SystemInformation.HorizontalScrollBarHeight)));
+
+        bool sincronizando = false;
+
+        void ActualizarRango()
+        {
+            if (contenedor.IsDisposed || grid.IsDisposed || barraHorizontal.IsDisposed)
+                return;
+
+            int anchoVisible = Math.Max(1, grid.ClientSize.Width - SystemInformation.VerticalScrollBarWidth);
+            int anchoContenido = grid.Columns
+                .Cast<DataGridViewColumn>()
+                .Where(columna => !columna.Frozen)
+                .Sum(columna => Math.Max(columna.Width, 260));
+            int desplazamientoMaximo = Math.Max(0, anchoContenido - anchoVisible);
+
+            sincronizando = true;
+            try
+            {
+                barraHorizontal.LargeChange = anchoVisible;
+                barraHorizontal.Maximum = desplazamientoMaximo + barraHorizontal.LargeChange - 1;
+                barraHorizontal.Enabled = desplazamientoMaximo > 0;
+                int valor = Math.Min(desplazamientoMaximo, grid.HorizontalScrollingOffset);
+                barraHorizontal.Value = valor;
+                grid.HorizontalScrollingOffset = valor;
+            }
+            finally
+            {
+                sincronizando = false;
+            }
+        }
+
+        barraHorizontal.ValueChanged += (_, _) =>
+        {
+            if (sincronizando || !barraHorizontal.Enabled)
+                return;
+
+            sincronizando = true;
+            try
+            {
+                grid.HorizontalScrollingOffset = barraHorizontal.Value;
+            }
+            finally
+            {
+                sincronizando = false;
+            }
+        };
+
+        grid.Scroll += (_, e) =>
+        {
+            if (e.ScrollOrientation != ScrollOrientation.HorizontalScroll || sincronizando || !barraHorizontal.Enabled)
+                return;
+
+            int valor = Math.Clamp(grid.HorizontalScrollingOffset, barraHorizontal.Minimum, barraHorizontal.Maximum - barraHorizontal.LargeChange + 1);
+            sincronizando = true;
+            try
+            {
+                barraHorizontal.Value = valor;
+            }
+            finally
+            {
+                sincronizando = false;
+            }
+        };
+
+        void AjustarColumnas()
+        {
+            foreach (DataGridViewColumn columna in grid.Columns)
+            {
+                if (!columna.Frozen && columna.Width != 260)
+                    columna.Width = 260;
+            }
+
+            ActualizarRango();
+        }
+
+        grid.ColumnAdded += (_, e) => e.Column.Width = 260;
+        grid.ColumnRemoved += (_, _) => ActualizarRango();
+        grid.ColumnWidthChanged += (_, _) => ActualizarRango();
+        grid.DataBindingComplete += (_, _) => AjustarColumnas();
+        grid.SizeChanged += (_, _) => ActualizarRango();
+
+        contenedor.Controls.Add(grid, 0, 0);
+        contenedor.Controls.Add(barraHorizontal, 0, 1);
+        ActualizarRango();
+        return contenedor;
+    }
 
     private static TextBox AgregarCampoTexto(Control contenedor, string etiqueta, ref int y, string valorInicial)
     {

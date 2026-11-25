@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using LogiMarket.Application.Comportamentales;
+using LogiMarket.Application.CasosUso;
 using LogiMarket.Application.Creacionales;
 using LogiMarket.Application.Estructurales;
 using LogiMarket.Application.Puertos;
@@ -35,6 +36,8 @@ public sealed class CoordinadorLogiMarketWinForms : IDisposable
     public HistorialBorradorCaretaker HistorialBorrador { get; }
     public FabricaMetadatosVisuales MetadatosVisuales { get; }
     public ISalidaDocumento SalidaComprobante { get; }
+    public ServicioAdministracionCatalogoClientes Administracion { get; }
+    public ProcesadorOutbox ProcesadorOutbox { get; }
 
     public CoordinadorLogiMarketWinForms(string? rutaBaseDatos = null)
     {
@@ -44,17 +47,20 @@ public sealed class CoordinadorLogiMarketWinForms : IDisposable
         Pedidos = new RepositorioPedidosSqlite(ContextoSqlite);
         AuditoriaOutbox = new RepositorioAuditoriaOutboxSqlite(ContextoSqlite);
         Metricas = MetricasSesion.Instancia;
+        Administracion = new ServicioAdministracionCatalogoClientes(ContextoSqlite, Catalogo, Clientes);
 
         ProveedorPago = new ProveedorPasarelaHeredado();
         var adaptador = new PasarelaPagoAdapter(ProveedorPago);
-        var proxy = new PagoAutorizadoProxy(adaptador, ContextoSqlite);
-        PasarelaPago = new AuditoriaPagoDecorator(proxy, AuditoriaOutbox, ContextoSqlite);
+        var decoradorAuditoria = new AuditoriaPagoDecorator(adaptador, AuditoriaOutbox, ContextoSqlite);
+        // Proxy exterior: las denegaciones no alcanzan el decorador ni generan log de cobro.
+        PasarelaPago = new PagoAutorizadoProxy(decoradorAuditoria, ContextoSqlite);
 
         PublicadorEventos = new PublicadorEventosSistema();
         PublicadorEventos.Suscribir(new ObservadorMetricasSesion(Metricas));
         PublicadorEventos.Suscribir(new ObservadorAuditoriaEvento(AuditoriaOutbox, ContextoSqlite));
-        var creadorNotif = new CreadorNotificadorArchivo();
+        var creadorNotif = new CreadorNotificadorEmail();
         PublicadorEventos.Suscribir(new ObservadorNotificacionAviso(creadorNotif.CrearNotificador()));
+        ProcesadorOutbox = new ProcesadorOutbox(AuditoriaOutbox, ContextoSqlite, PublicadorEventos);
 
         Invocador = new InvocadorComandos();
         Borrador = new BorradorPedidoOriginator();
@@ -62,28 +68,10 @@ public sealed class CoordinadorLogiMarketWinForms : IDisposable
         MetadatosVisuales = new FabricaMetadatosVisuales();
         SalidaComprobante = new SalidaArchivoComprobante();
 
-        ContextoSqlite.IniciarSesion(new UsuarioSesion(
-            Guid.Parse("11111111-1111-1111-1111-111111111101"),
-            "admin",
-            "Administrador General",
-            RolUsuario.ADMIN));
     }
 
     public Task InicializarAsync(CancellationToken ct = default) =>
         ContextoSqlite.InicializarEsquemaAsync(ct);
-
-    public void CambiarRolDemo(RolUsuario nuevoRol)
-    {
-        string usuario = nuevoRol switch
-        {
-            RolUsuario.ADMIN => "admin",
-            RolUsuario.VENTAS => "vendedor1",
-            RolUsuario.BODEGA => "bodega1",
-            _ => "consulta1"
-        };
-
-        ContextoSqlite.IniciarSesion(new UsuarioSesion(Guid.NewGuid(), usuario, $"Operador {nuevoRol}", nuevoRol));
-    }
 
     public async Task<Pedido> ConstruirPedidoDesdeBorradorAsync(Cliente cliente, string codigoPedido, CancellationToken ct = default)
     {

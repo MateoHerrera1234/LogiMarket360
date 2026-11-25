@@ -206,12 +206,28 @@ VALUES ($kitSku, $compSku, $cant);";
         var conexion = await _contexto.ObtenerConexionAbiertaAsync(ct);
         try
         {
+            // Apply the delta against the value held by SQLite. This prevents a stale
+            // read in a competing operation from overwriting a newer stock balance.
             await using var cmdUpd = conexion.CreateCommand();
             cmdUpd.Transaction = _contexto.TransaccionActual;
-            cmdUpd.CommandText = "UPDATE CatalogoElementos SET StockDisponible = $stock WHERE Sku = $sku";
-            cmdUpd.Parameters.AddWithValue("$stock", nuevoStock);
+            cmdUpd.CommandText = @"
+UPDATE CatalogoElementos
+SET StockDisponible = StockDisponible + $delta
+WHERE Sku = $sku AND StockDisponible + $delta >= 0;";
+            cmdUpd.Parameters.AddWithValue("$delta", deltaMovimiento);
             cmdUpd.Parameters.AddWithValue("$sku", sku);
-            await cmdUpd.ExecuteNonQueryAsync(ct);
+            int filasActualizadas = await cmdUpd.ExecuteNonQueryAsync(ct);
+            if (filasActualizadas != 1)
+                throw new InvalidOperationException($"No se pudo actualizar el stock de {sku}: el producto no existe o el stock resultante sería negativo.");
+
+            await using var cmdLeerStock = conexion.CreateCommand();
+            cmdLeerStock.Transaction = _contexto.TransaccionActual;
+            cmdLeerStock.CommandText = "SELECT StockDisponible FROM CatalogoElementos WHERE Sku = $sku";
+            cmdLeerStock.Parameters.AddWithValue("$sku", sku);
+            object? stockLeido = await cmdLeerStock.ExecuteScalarAsync(ct);
+            if (stockLeido is null || stockLeido is DBNull)
+                throw new InvalidOperationException($"No se pudo leer el stock actualizado de {sku}.");
+            int stockResultante = Convert.ToInt32(stockLeido, CultureInfo.InvariantCulture);
 
             await using var cmdMov = conexion.CreateCommand();
             cmdMov.Transaction = _contexto.TransaccionActual;
@@ -222,7 +238,7 @@ VALUES ($id, $fecha, $sku, $delta, $stock, $motivo, $ref);";
             cmdMov.Parameters.AddWithValue("$fecha", DateTime.UtcNow.ToString("O"));
             cmdMov.Parameters.AddWithValue("$sku", sku);
             cmdMov.Parameters.AddWithValue("$delta", deltaMovimiento);
-            cmdMov.Parameters.AddWithValue("$stock", nuevoStock);
+            cmdMov.Parameters.AddWithValue("$stock", stockResultante);
             cmdMov.Parameters.AddWithValue("$motivo", motivo ?? string.Empty);
             cmdMov.Parameters.AddWithValue("$ref", referencia ?? string.Empty);
             await cmdMov.ExecuteNonQueryAsync(ct);
@@ -588,6 +604,54 @@ WHERE Id = $id;";
             cmd.Parameters.AddWithValue("$clave", claveIdempotencia);
             long count = Convert.ToInt64(await cmd.ExecuteScalarAsync(ct) ?? 0L);
             return count > 0;
+        }
+        finally
+        {
+            if (!_contexto.EsConexionCompartida(conexion))
+                await conexion.DisposeAsync();
+        }
+    }
+
+    public async Task<PagoRegistrado?> ObtenerPagoPorClaveAsync(string claveIdempotencia, CancellationToken ct = default)
+    {
+        var conexion = await _contexto.ObtenerConexionAbiertaAsync(ct);
+        try
+        {
+            await using var cmd = conexion.CreateCommand();
+            cmd.Transaction = _contexto.TransaccionActual;
+            cmd.CommandText = "SELECT PedidoId, ReferenciaPasarela, Proveedor, Monto FROM PagosPedido WHERE ClaveIdempotencia = $clave";
+            cmd.Parameters.AddWithValue("$clave", claveIdempotencia);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return null;
+
+            return new PagoRegistrado(
+                Guid.Parse(reader.GetString(0)),
+                reader.GetString(1),
+                reader.GetString(2),
+                Convert.ToDecimal(reader.GetDouble(3), CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            if (!_contexto.EsConexionCompartida(conexion))
+                await conexion.DisposeAsync();
+        }
+    }
+
+    public async Task<PagoRegistrado?> ObtenerPagoPorPedidoAsync(Guid pedidoId, CancellationToken ct = default)
+    {
+        var conexion = await _contexto.ObtenerConexionAbiertaAsync(ct);
+        try
+        {
+            await using var cmd = conexion.CreateCommand();
+            cmd.Transaction = _contexto.TransaccionActual;
+            cmd.CommandText = "SELECT ClaveIdempotencia, ReferenciaPasarela, Proveedor, Monto FROM PagosPedido WHERE PedidoId = $pedido ORDER BY FechaUtc DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("$pedido", pedidoId.ToString());
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return null;
+
+            return new PagoRegistrado(pedidoId, reader.GetString(1), reader.GetString(2), Convert.ToDecimal(reader.GetDouble(3), CultureInfo.InvariantCulture));
         }
         finally
         {

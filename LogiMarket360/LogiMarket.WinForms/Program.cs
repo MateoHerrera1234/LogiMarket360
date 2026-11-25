@@ -1,3 +1,6 @@
+using Microsoft.Extensions.DependencyInjection;
+using LogiMarket.Application.Creacionales;
+
 namespace LogiMarket.WinForms
 {
     internal static class Program
@@ -11,7 +14,12 @@ namespace LogiMarket.WinForms
             // To customize application configuration such as set high DPI settings or default font,
             // see https://aka.ms/applicationconfiguration.
             ApplicationConfiguration.Initialize();
-            System.Windows.Forms.Application.Run(new Form1());
+            var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+            services.AddSingleton<IMetricasSesion>(MetricasSesion.Instancia);
+            services.AddSingleton<Coordinacion.CoordinadorLogiMarketWinForms>();
+            services.AddTransient<Form1>();
+            using var provider = services.BuildServiceProvider();
+            System.Windows.Forms.Application.Run(provider.GetRequiredService<Form1>());
         }
     }
 }

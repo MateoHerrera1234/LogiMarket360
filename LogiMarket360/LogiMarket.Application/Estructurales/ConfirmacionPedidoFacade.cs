@@ -72,73 +72,58 @@ public sealed class ConfirmacionPedidoFacade
                 string.Empty);
         }
 
-        if (await _repositorioPedidos.ExisteClaveIdempotenciaAsync(claveIdempotencia, ct))
-        {
-            return new ResultadoConfirmacionPedido(
-                false,
-                $"Operacion duplicada detectada (idempotencia: {claveIdempotencia})",
-                pedido.Id,
-                pedido.Codigo,
-                pedido.Total,
-                string.Empty,
-                string.Empty);
-        }
-
-        if (pedido.Estado == EstadoPedido.BORRADOR)
-            pedido.Validar();
-
         var requerimientos = pedido.ObtenerRequerimientosStockPorSku();
-        foreach (var (sku, cantidadRequerida) in requerimientos)
-        {
-            var elemento = await _repositorioCatalogo.ObtenerPorSkuAsync(sku, ct);
-            if (elemento is null)
-            {
-                return new ResultadoConfirmacionPedido(
-                    false,
-                    $"No existe el componente fisico con SKU {sku}",
-                    pedido.Id,
-                    pedido.Codigo,
-                    pedido.Total,
-                    string.Empty,
-                    string.Empty);
-            }
-
-            if (elemento.StockDisponible < cantidadRequerida)
-            {
-                return new ResultadoConfirmacionPedido(
-                    false,
-                    $"Stock insuficiente para SKU {sku}: disponible {elemento.StockDisponible}, requerido {cantidadRequerida}",
-                    pedido.Id,
-                    pedido.Codigo,
-                    pedido.Total,
-                    string.Empty,
-                    string.Empty);
-            }
-        }
-
-        var cobro = await _pasarelaPago.CobrarAsync(pedido.Total, claveIdempotencia, ct);
-        if (!cobro.Exitoso)
-        {
-            _metricas.RegistrarCobroRechazado();
-            return new ResultadoConfirmacionPedido(
-                false,
-                $"Cobro rechazado: {cobro.Mensaje}",
-                pedido.Id,
-                pedido.Codigo,
-                pedido.Total,
-                cobro.ReferenciaTransaccion,
-                string.Empty);
-        }
-
-        pedido.MarcarComoPagado();
         string usuario = _sesion.UsuarioActual?.NombreUsuario ?? "SISTEMA";
-        string guiaGenerada = SelectorFabricaEntrega
-            .ObtenerFabrica(pedido.TipoEntrega)
-            .CrearGeneradorGuia()
-            .GenerarEtiquetaGuia(pedido.Codigo, pedido.NombreCliente);
+        string guiaGenerada = SelectorFabricaEntrega.ObtenerFabrica(pedido.TipoEntrega)
+            .CrearGeneradorGuia().GenerarEtiquetaGuia(pedido.Codigo, pedido.NombreCliente);
+        ResultadoConfirmacionPedido resultado = new(false, "La confirmación no se completó", pedido.Id, pedido.Codigo, pedido.Total, string.Empty, string.Empty);
+        bool cobroRechazado = false;
 
+        // La clave y el stock se vuelven a comprobar dentro de la misma transacción que escribe pago,
+        // pedido, movimientos y Outbox. Esto evita que dos confirmaciones concurrentes lean el mismo stock.
         await _unidadTrabajo.EjecutarEnTransaccionAsync(async token =>
         {
+            var pagoExistente = await _repositorioPedidos.ObtenerPagoPorClaveAsync(claveIdempotencia, token);
+            if (pagoExistente is not null)
+            {
+                resultado = pagoExistente.PedidoId == pedido.Id
+                    ? new ResultadoConfirmacionPedido(true, "Se devuelve el resultado del cobro ya registrado", pedido.Id, pedido.Codigo, pagoExistente.Monto, pagoExistente.ReferenciaPasarela, string.Empty)
+                    : new ResultadoConfirmacionPedido(false, "La clave de idempotencia ya pertenece a otro pedido", pedido.Id, pedido.Codigo, pedido.Total, string.Empty, string.Empty);
+                return;
+            }
+
+            if (pedido.Estado is not (EstadoPedido.BORRADOR or EstadoPedido.VALIDADO))
+            {
+                resultado = new ResultadoConfirmacionPedido(false, $"No se puede confirmar un pedido en estado {pedido.Estado}", pedido.Id, pedido.Codigo, pedido.Total, string.Empty, string.Empty);
+                return;
+            }
+            if (pedido.Estado == EstadoPedido.BORRADOR)
+                pedido.Validar();
+
+            foreach (var (sku, cantidadRequerida) in requerimientos)
+            {
+                var elemento = await _repositorioCatalogo.ObtenerPorSkuAsync(sku, token);
+                if (elemento is null)
+                {
+                    resultado = new ResultadoConfirmacionPedido(false, $"No existe el componente fisico con SKU {sku}", pedido.Id, pedido.Codigo, pedido.Total, string.Empty, string.Empty);
+                    return;
+                }
+                if (elemento.StockDisponible < cantidadRequerida)
+                {
+                    resultado = new ResultadoConfirmacionPedido(false, $"Stock insuficiente para SKU {sku}: disponible {elemento.StockDisponible}, requerido {cantidadRequerida}", pedido.Id, pedido.Codigo, pedido.Total, string.Empty, string.Empty);
+                    return;
+                }
+            }
+
+            var cobro = await _pasarelaPago.CobrarAsync(pedido.Total, claveIdempotencia, token);
+            if (!cobro.Exitoso)
+            {
+                cobroRechazado = true;
+                resultado = new ResultadoConfirmacionPedido(false, $"Cobro rechazado: {cobro.Mensaje}", pedido.Id, pedido.Codigo, pedido.Total, cobro.ReferenciaTransaccion, string.Empty);
+                return;
+            }
+
+            pedido.MarcarComoPagado();
             var existente = await _repositorioPedidos.ObtenerPorIdAsync(pedido.Id, token);
             if (existente is null)
                 await _repositorioPedidos.GuardarNuevoAsync(pedido, token);
@@ -149,58 +134,25 @@ public sealed class ConfirmacionPedidoFacade
             {
                 var prod = await _repositorioCatalogo.ObtenerPorSkuAsync(sku, token);
                 int nuevoStock = prod!.StockDisponible - cantidadRequerida;
-                await _repositorioCatalogo.ActualizarStockAsync(
-                    sku,
-                    nuevoStock,
-                    -cantidadRequerida,
-                    $"VENTA_{pedido.Codigo}",
-                    pedido.Codigo,
-                    token);
+                await _repositorioCatalogo.ActualizarStockAsync(sku, nuevoStock, -cantidadRequerida, $"VENTA_{pedido.Codigo}", pedido.Codigo, token);
             }
 
-            await _repositorioPedidos.RegistrarPagoAprobadoAsync(
-                pedido.Id,
-                claveIdempotencia,
-                cobro.ReferenciaTransaccion,
-                cobro.Proveedor,
-                pedido.Total,
-                token);
-
-            await _auditoriaOutbox.RegistrarAuditoriaAsync(
-                "PEDIDO",
-                "CONFIRMAR_PEDIDO",
-                $"Pedido {pedido.Codigo} pagado por ${pedido.Total:0.00} (Ref: {cobro.ReferenciaTransaccion})",
-                usuario,
-                claveIdempotencia,
-                token);
+            await _repositorioPedidos.RegistrarPagoAprobadoAsync(pedido.Id, claveIdempotencia, cobro.ReferenciaTransaccion, cobro.Proveedor, pedido.Total, token);
+            await _auditoriaOutbox.RegistrarAuditoriaAsync("PEDIDO", "CONFIRMAR_PEDIDO", $"Pedido {pedido.Codigo} pagado por ${pedido.Total:0.00} (Ref: {cobro.ReferenciaTransaccion})", usuario, claveIdempotencia, token);
 
             string payload = JsonSerializer.Serialize(new
             {
-                pedido.Id,
-                pedido.Codigo,
-                pedido.ClienteId,
-                pedido.NombreCliente,
-                pedido.Total,
-                cobro.ReferenciaTransaccion,
-                Guia = guiaGenerada
+                pedido.Id, pedido.Codigo, pedido.ClienteId, pedido.NombreCliente, pedido.Total,
+                ReferenciaPasarela = cobro.ReferenciaTransaccion, Guia = guiaGenerada
             });
-
-            await _auditoriaOutbox.AgregarEventoOutboxAsync(
-                "PedidoConfirmado",
-                payload,
-                $"OUTBOX-CONF-{claveIdempotencia}",
-                token);
+            await _auditoriaOutbox.AgregarEventoOutboxAsync("PedidoConfirmado", payload, $"OUTBOX-CONF-{claveIdempotencia}", token);
+            resultado = new ResultadoConfirmacionPedido(true, $"Pedido {pedido.Codigo} confirmado y pagado correctamente", pedido.Id, pedido.Codigo, pedido.Total, cobro.ReferenciaTransaccion, guiaGenerada);
         }, ct);
 
-        _metricas.RegistrarPedidoConfirmado(pedido.Total);
-
-        return new ResultadoConfirmacionPedido(
-            true,
-            $"Pedido {pedido.Codigo} confirmado y pagado correctamente",
-            pedido.Id,
-            pedido.Codigo,
-            pedido.Total,
-            cobro.ReferenciaTransaccion,
-            guiaGenerada);
+        if (cobroRechazado)
+            _metricas.RegistrarCobroRechazado();
+        if (resultado.Exitoso && resultado.Mensaje.Contains("confirmado y pagado", StringComparison.Ordinal))
+            _metricas.RegistrarPedidoConfirmado(resultado.TotalCobrado);
+        return resultado;
     }
 }

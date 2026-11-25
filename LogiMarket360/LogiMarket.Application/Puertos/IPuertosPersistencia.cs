@@ -50,10 +50,14 @@ public interface IRepositorioPedidos
     Task GuardarNuevoAsync(Pedido pedido, CancellationToken ct = default);
     Task ActualizarAsync(Pedido pedido, CancellationToken ct = default);
     Task<bool> ExisteClaveIdempotenciaAsync(string claveIdempotencia, CancellationToken ct = default);
+    Task<PagoRegistrado?> ObtenerPagoPorClaveAsync(string claveIdempotencia, CancellationToken ct = default);
+    Task<PagoRegistrado?> ObtenerPagoPorPedidoAsync(Guid pedidoId, CancellationToken ct = default);
     Task RegistrarPagoAprobadoAsync(Guid pedidoId, string claveIdempotencia, string referenciaPasarela, string proveedor, decimal monto, CancellationToken ct = default);
     Task RegistrarDespachoAsync(Guid pedidoId, string numeroGuia, string tipoEntrega, int plazoDias, CancellationToken ct = default);
     Task RegistrarDevolucionAsync(Guid pedidoId, MotivoDevolucion motivo, decimal montoReembolso, bool stockReintegrado, string observacion, CancellationToken ct = default);
 }
+
+public sealed record PagoRegistrado(Guid PedidoId, string ReferenciaPasarela, string Proveedor, decimal Monto);
 
 // Puerto para persistencia transaccional de Outbox y auditoria
 public interface IRepositorioAuditoriaOutbox

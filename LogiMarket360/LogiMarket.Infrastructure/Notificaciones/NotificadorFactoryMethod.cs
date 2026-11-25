@@ -52,6 +52,29 @@ public sealed class NotificadorMemoriaDiagnostico : INotificadorAviso
     }
 }
 
+// Canal EMAIL simulado: registra el mensaje en un archivo local sin enviar correo externo.
+public sealed class NotificadorEmailSimulado : INotificadorAviso
+{
+    private readonly NotificadorArchivoLocal _registro;
+    public string Canal => "EMAIL";
+    public NotificadorEmailSimulado(string? ruta = null) => _registro = new NotificadorArchivoLocal(ruta ?? RutaCanal("email"));
+    public Task EnviarAsync(string destinatario, string asunto, string mensaje, CancellationToken ct = default) =>
+        _registro.EnviarAsync($"EMAIL:{destinatario}", asunto, mensaje, ct);
+
+    internal static string RutaCanal(string canal) => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LogiMarket360", $"notificaciones-{canal}.log");
+}
+
+// Canal SMS simulado: registra el mensaje en un archivo local sin enviar SMS externo.
+public sealed class NotificadorSmsSimulado : INotificadorAviso
+{
+    private readonly NotificadorArchivoLocal _registro;
+    public string Canal => "SMS";
+    public NotificadorSmsSimulado(string? ruta = null) => _registro = new NotificadorArchivoLocal(ruta ?? NotificadorEmailSimulado.RutaCanal("sms"));
+    public Task EnviarAsync(string destinatario, string asunto, string mensaje, CancellationToken ct = default) =>
+        _registro.EnviarAsync($"SMS:{destinatario}", asunto, mensaje, ct);
+}
+
 // Creador abstracto del patron Factory Method
 public abstract class CreadorNotificadorAviso
 {
@@ -74,4 +97,18 @@ public sealed class CreadorNotificadorMemoria : CreadorNotificadorAviso
     public CreadorNotificadorMemoria(NotificadorMemoriaDiagnostico? instancia = null) =>
         _instancia = instancia ?? new NotificadorMemoriaDiagnostico();
     public override INotificadorAviso CrearNotificador() => _instancia;
+}
+
+public sealed class CreadorNotificadorEmail : CreadorNotificadorAviso
+{
+    private readonly string? _ruta;
+    public CreadorNotificadorEmail(string? ruta = null) => _ruta = ruta;
+    public override INotificadorAviso CrearNotificador() => new NotificadorEmailSimulado(_ruta);
+}
+
+public sealed class CreadorNotificadorSms : CreadorNotificadorAviso
+{
+    private readonly string? _ruta;
+    public CreadorNotificadorSms(string? ruta = null) => _ruta = ruta;
+    public override INotificadorAviso CrearNotificador() => new NotificadorSmsSimulado(_ruta);
 }
